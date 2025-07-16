@@ -16,9 +16,12 @@ from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
 MIN_RMS = 2000
 MAX_RMS = 4000  
 MAX_SATURATION_FRAMES = 30
-MAX_NOISE_LEVEL = 0.25
+MAX_NOISE_LEVEL = 0.2
 MIN_SPECTRAL_CENTROID = 600 
 MAX_SPECTRAL_CENTROID = 1200
+MIN_SPEECH_RATIO = 0.4
+MIN_SIGNAL_STD = 0.015
+MIN_SPECTRAL_ROLLOFF = 1700
 
 PLOT_LOCK = threading.Lock()
 
@@ -42,7 +45,9 @@ class AudioProcessor:
         self.noise_level = 0
         self.spectral_centroid = 0
         self.spectral_rolloff = 0
-        self.zero_crossing_rate = 0
+        self.speech_ratio = 0
+        self.signal_std = 0
+        self.speech_segments = []
 
         self.verbose = verbose
         self.enhanced_samples = None
@@ -56,7 +61,7 @@ class AudioProcessor:
 
             board = Pedalboard([
                 HighpassFilter(cutoff_frequency_hz=100),
-                LowpassFilter(cutoff_frequency_hz=1300),
+                LowpassFilter(cutoff_frequency_hz=4000),
                 Compressor(threshold_db=-20, ratio=3.0),
                 NoiseGate(threshold_db=-45, ratio=3.0),
                 Reverb(room_size=0.1, damping=0.8, wet_level=0.05, dry_level=0.95),
@@ -85,7 +90,10 @@ class AudioProcessor:
         audio = self.preprocessed_audio
         self.rms = audio.rms
 
-        audio = audio.set_channels(1) # conversion en mono
+        if self.original_audio.channels > 1:
+            audio = audio.set_channels(1) # conversion en mono
+            
+        audio = audio.set_frame_rate(16000)
         samples = np.array(audio.get_array_of_samples()).astype(np.float32) # permet d'avoir et d'analyser la courbe du signal
 
         if len(samples) > 0:
@@ -105,9 +113,8 @@ class AudioProcessor:
         """
         
         """
-        # on va essayer d'estimer le bruit dans les premières et dernières ms (~500)
-        zero_crossings = np.sum(np.diff(np.signbit(samples)))
-        self.zero_crossing_rate = zero_crossings / len(samples)
+        signal_std = np.std(samples)
+        self.signal_std = signal_std
 
         # on va ensuite estimer le niveau de bruit global de l'audio
         self.estimate_noise_level(samples, sr)
@@ -120,21 +127,23 @@ class AudioProcessor:
             tmp_path = self.audio_path.replace(".wav", "_noise_tmp.wav")
             self.preprocessed_audio.export(tmp_path, format="wav")
 
-            wav = read_audio(tmp_path, sampling_rate=sr)
+            wav = read_audio(tmp_path, sampling_rate=16000)
             speech_segments = get_speech_timestamps(
-                wav, self.val_model, sampling_rate=sr,
+                wav, self.val_model, sampling_rate=16000,
                 threshold=0.3, min_speech_duration_ms=100
             )
 
             os.remove(tmp_path)
 
+            # Calculer le ratio de parole
+            total_speech_samples = sum(seg['end'] - seg['start'] for seg in speech_segments)
+            self.speech_ratio = total_speech_samples / len(wav) if len(wav) > 0 else 0
+
             if speech_segments:
                 speech_mask = np.zeros(len(samples), dtype=bool)
                 for seg in speech_segments:
-                    start_idx = int(seg['start'] * sr / 16000)
-                    end_idx = int(seg['end'] * sr / 16000)
-                    start_idx = max(0, min(start_idx, len(samples)))
-                    end_idx = max(0, min(end_idx, len(samples)))
+                    start_idx = max(0, min(seg['start'], len(samples)))
+                    end_idx = max(0, min(seg['end'], len(samples)))
                     speech_mask[start_idx:end_idx] = True
 
                 noise_samples = samples[~speech_mask]
@@ -142,12 +151,14 @@ class AudioProcessor:
                     self.noise_level = np.std(noise_samples)
                 else:
                     self.noise_level = 0
+                self.speech_segments = speech_segments
             else:
                 self.noise_level = np.std(samples)
             
         except Exception as e:
             if self.verbose:
                 print(f"Erreur lors de l'estimation du bruit: {e}")
+            self.speech_ratio = 0
             self.noise_level = 1.0
 
     def analyze_frequency(self, samples, sr):
@@ -174,7 +185,7 @@ class AudioProcessor:
             self.spectral_centroid = 0
             self.spectral_rolloff = 0
 
-        self.save_plot(samples, sr, xf, yf)
+        # self.save_plot(samples, sr, xf, yf)
 
     def check_rejection_criteria(self):
         """
@@ -188,6 +199,10 @@ class AudioProcessor:
         elif self.rms > MAX_RMS:
             self.should_reject = True
             self.rejection_reasons.append(f"RMS trop élevé: {self.rms}")
+        
+        if self.speech_ratio < MIN_SPEECH_RATIO:
+            self.should_reject = True
+            self.rejection_reasons.append(f"Ratio de parole insuffisant: {self.speech_ratio:.2f}")
 
         if self.saturation_count > MAX_SATURATION_FRAMES:
             self.should_reject = True
@@ -200,6 +215,14 @@ class AudioProcessor:
         if not (MIN_SPECTRAL_CENTROID <= self.spectral_centroid <= MAX_SPECTRAL_CENTROID):
             self.should_reject = True
             self.rejection_reasons.append(f"Centroïde spectral hors limites: {self.spectral_centroid:.0f}Hz")
+
+        if self.signal_std < MIN_SIGNAL_STD:
+            self.should_reject = True
+            self.rejection_reasons.append(f"Signal trop plat: {self.signal_std:.4f}")
+        
+        if self.spectral_rolloff < MIN_SPECTRAL_ROLLOFF:
+            self.should_reject = True
+            self.rejection_reasons.append(f"Faible articulation: {self.spectral_rolloff:.0f}")
 
         if self.verbose and self.should_reject:
             print(f"Audio rejeté - Raisons: {', '.join(self.rejection_reasons)}")
@@ -260,15 +283,7 @@ class AudioProcessor:
                 plt.cla()  # Clear current axes
 
     def apply_vad(self):
-        tmp_path = self.audio_path.replace(".wav", "_tmp.wav")
-        self.preprocessed_audio.export(tmp_path, format="wav")
-        wav = read_audio(tmp_path, sampling_rate=16000)
-        speech_segments = get_speech_timestamps(
-            wav, self.val_model, sampling_rate=16000,
-            threshold=0.2, min_speech_duration_ms=150,
-            speech_pad_ms=300
-        )
-        os.remove(tmp_path)
+        speech_segments = self.speech_segments
 
         cleaned = AudioSegment.empty()
         for seg in speech_segments:
@@ -279,16 +294,16 @@ class AudioProcessor:
             
         cleaned.export(self.cleaned_path, format="wav")
 
-    def log_to_csv(self, output_csv="audio_quality_log.csv"):
+    def log_to_csv(self, output_csv="data/audio_quality_log.csv"):
         file_exists = os.path.isfile(output_csv)
         with open(output_csv, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if not file_exists:
                 writer.writerow([
                     "file", "duration", "rms", "saturation_count", 
-                    "dominant_freq", "mean_freq", "bandwidth", 
-                    "noise_level", "spectral_centroid", 
-                    "spectral_rolloff", "zero_crossing_rate",
+                    # "dominant_freq", "mean_freq", "bandwidth", 
+                    "speech_ratio", "noise_level", "spectral_centroid", 
+                    "spectral_rolloff", "signal_std",
                     "rejected", "rejection_reasons"
                 ])
 
@@ -297,13 +312,14 @@ class AudioProcessor:
                 round(self.duration_sec, 2),
                 self.rms,
                 self.saturation_count,
-                round(self.dominant_freq, 2),
-                round(self.mean_freq, 2),
-                round(self.bandwidth, 2),
+                # round(self.dominant_freq, 2),
+                # round(self.mean_freq, 2),
+                # round(self.bandwidth, 2),
+                round(self.speech_ratio, 3),
                 round(self.noise_level, 3),
                 round(self.spectral_centroid, 2),
                 round(self.spectral_rolloff, 2),
-                round(self.zero_crossing_rate, 4),
+                round(self.signal_std, 3),
                 self.should_reject,
                 "; ".join(self.rejection_reasons) if self.rejection_reasons else ""
             ])

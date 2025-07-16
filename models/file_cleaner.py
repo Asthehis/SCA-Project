@@ -4,7 +4,7 @@ class FileCleaner:
     def __init__(self, directory):
         self.directory = directory
 
-    def remove_cleaned_files(self, extensions=[".wav", ".txt"]):
+    def remove_files(self, extensions=[".wav", ".txt"]):
         """
         Supprime tous les fichiers contenant "_cleaned" dans le nom et ayant l'une des extensions spécifiées.
         """
@@ -17,8 +17,14 @@ class FileCleaner:
                     removed_files.append(fname)
                 except Exception as e:
                     print(f"Erreur lors de la suppression de {fname} : {e}")
+            elif fname.endswith(".csv"):
+                full_path = os.path.join(self.directory, fname)
+                try:
+                    os.remove(full_path)
+                    removed_files.append(fname)
+                except Exception as e:
+                    print(f"Erreur lors de la suppression de {fname} : {e}")
 
         print(f"{len(removed_files)} fichiers supprimés :")
         for f in removed_files:
             print(f" - {f}")
-
