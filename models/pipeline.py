@@ -12,11 +12,12 @@ NUM_THREADS_AUDIO = 4
 NUM_TRHEADS_TRANSCRIPTION = 1
 AUDIO_DIR = "data/audio/hospital"
 TRANSCRIPT_DIR = "data/transcript"
+SECOND_TRANSCRIPT_DIR = "data/transcript/REJECTED"
 CSV_DIR = "data"
 
 def clean():
     # Nettoyage des audio & transcriptions
-    for directory in [AUDIO_DIR, TRANSCRIPT_DIR, CSV_DIR]:
+    for directory in [AUDIO_DIR, TRANSCRIPT_DIR, SECOND_TRANSCRIPT_DIR, CSV_DIR]:
         cleaner = FileCleaner(directory)
         cleaner.remove_files()
 
@@ -50,7 +51,7 @@ def transcription(audio_path, model):
 
 def main():
     clean()
-    whisper_model = whisper.load_model("large-v2")
+    whisper_model = whisper.load_model("large-v3-turbo")
 
     audio_files = [
         os.path.join(AUDIO_DIR, f)
