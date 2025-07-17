@@ -44,7 +44,6 @@ def transcription(audio_path, model):
         thread_name = current_thread().name
         transcriber = Transcriber(audio_path, model=model)
         transcriber.transcribe()
-        transcriber.save_transcript() # mettre ça dans transcriber directement pour faire un if avg > 0.3...
     except Exception as e:
         print(f"[{thread_name}] : Erreur lors du traitement de ({audio_path}) : {e}")
 
